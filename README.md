@@ -10,7 +10,7 @@ A Python client for Glasses3. It handles all the low level details of communicat
 
 ## Installation
 
-For the moment we only support *Python 3.10*.
+This fork should be compatible with *Python 3.12*.
 
 To install this package, clone it and use either
 
