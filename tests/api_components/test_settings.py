@@ -1,7 +1,8 @@
 from typing import List, cast
-
+import pytest
 from g3pylib import Glasses3
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 async def test_get_gaze_frequency(g3: Glasses3):
     assert type(await g3.settings.get_gaze_frequency()) is int

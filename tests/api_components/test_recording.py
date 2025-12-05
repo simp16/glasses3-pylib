@@ -7,8 +7,9 @@ import pytest
 from g3pylib import Glasses3
 from g3pylib.recordings.recording import Recording
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 async def recording(g3: Glasses3):
     await g3.recorder.start()
     uuid = cast(str, await g3.recorder.get_uuid())

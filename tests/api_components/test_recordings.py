@@ -4,6 +4,7 @@ import pytest
 
 from g3pylib import Glasses3
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 async def test_get_name(g3: Glasses3):
     assert await g3.recordings.get_name() == "recordings"
