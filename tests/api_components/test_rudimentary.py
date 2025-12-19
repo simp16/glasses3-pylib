@@ -5,6 +5,7 @@ import pytest
 
 from g3pylib import Glasses3
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 class TestStreamNotRunning:
     @staticmethod

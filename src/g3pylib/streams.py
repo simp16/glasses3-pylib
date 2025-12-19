@@ -36,7 +36,13 @@ from g3pylib.g3typing import JSONObject
 TIMESTAMP_GRANULARITY = 90000
 FRAME_QUEUE_SIZE = 10
 DATA_QUEUE_SIZE = 100
-RTCP_QUEUE_SIZE = 100
+RTCP_QUEUE_SIZE = 500  # Increased from 100 - RTCP packets used for timestamp info, not continuous consumption
+SAFE_DECODE = True
+"""Global flag to enable full decode in separate process by default.
+
+When True, the entire decode operation (parse + decode) runs in a separate
+process that can be automatically restarted on crashes.
+"""
 
 _logger: logging.Logger = logging.getLogger(__name__)
 
@@ -270,15 +276,24 @@ class Stream(RTPTransportClient, ABC):
     @classmethod
     @asynccontextmanager
     async def setup(
-        cls, connection: RTSPConnection, stream_type: StreamType, scheme: str
+        cls, connection: RTSPConnection, stream_type: StreamType, scheme: str, safe_decode: Optional[bool] = None
     ) -> AsyncIterator[Stream]:
         """The main entry point of a `Stream`.
 
         Sets up a transport for RTP and RTCP packets and instantiates a `Stream` object containing the transport.
+        
+        Args:
+            connection: RTSP connection
+            stream_type: Type of stream
+            scheme: URL scheme
+            safe_decode: If True, run entire decode in separate process (more robust)
         """
         transport_class = transport_for_scheme(scheme)
         async with transport_class(connection) as transport:
-            yield cls(transport, stream_type)
+            if hasattr(cls, '__name__') and cls.__name__ == 'VideoStream':
+                yield cls(transport, stream_type, safe_decode)  # type: ignore
+            else:
+                yield cls(transport, stream_type)
 
     @abstractmethod
     @asynccontextmanager
@@ -372,7 +387,7 @@ class VideoStream(Stream):
 
     _nal_unit_builder: Tuple[NALUnit, Optional[float]]
 
-    def __init__(self, transport: RTPTransport, stream_type: StreamType) -> None:
+    def __init__(self, transport: RTPTransport, stream_type: StreamType, safe_decode: Optional[bool] = None) -> None:
         super().__init__(transport, stream_type)
         self.codec_context: Any = av.CodecContext.create("h264", "r")  # type: ignore
         self.sps_or_pps_received = False
@@ -380,6 +395,8 @@ class VideoStream(Stream):
         self._demux_out_count = 0
         self._decode_count = 0
         self._fragment_count = 0
+        self._safe_decode_mode = SAFE_DECODE if safe_decode is None else safe_decode
+        self._decoder_worker: Optional[Any] = None  # Decoder worker manager for safe_decode mode
 
     @property
     def media_type(self) -> MediaType:
@@ -389,11 +406,27 @@ class VideoStream(Stream):
     @property
     def stats(self) -> Dict[str, int]:
         """Contains some media stream statistics. Used mainly for debugging purposes."""
-        return {
+        stats = {
             "demux_in_count": self._demux_in_count,
             "demux_out_count": self._demux_out_count,
             "decode_count": self._decode_count,
         }
+        
+        # Add decoder worker stats if using safe_decode
+        if self._decoder_worker:
+            try:
+                worker_stats = self._decoder_worker.stats()
+                stats.update({
+                    "decoder_spawned": worker_stats["spawned"],
+                    "decoder_restarted": worker_stats["restarted"],
+                    "decoder_nals_submitted": worker_stats["nals_submitted"],
+                    "decoder_frames_received": worker_stats["frames_received"],
+                    "decoder_alive": worker_stats["alive"],
+                })
+            except Exception:
+                pass
+        
+        return stats
 
     @asynccontextmanager
     async def demux(
@@ -467,35 +500,138 @@ class VideoStream(Stream):
         Spawns a decoder task which uses PyAV (ffmpeg) to parse and decode the demuxed NAL units.
 
         The returned queue contains PyAVs `av.VideoFrame` objects along with timestamps.
+        
+        If safe_decode mode is enabled, entire decode runs in separate process that can restart on crash.
         """
         frame_queue: asyncio.Queue[Tuple[Any, Optional[float]]] = asyncio.Queue(
             FRAME_QUEUE_SIZE
         )
-
+        
+        # Choose decode strategy
+        if self._safe_decode_mode:
+            # Use decoder worker process (most robust)
+            async with self._decode_with_worker(frame_queue):
+                yield frame_queue
+        else:
+            # Use original in-process decode
+            async with self._decode_in_process(frame_queue):
+                yield frame_queue
+    
+    @asynccontextmanager
+    async def _decode_with_worker(self, frame_queue: asyncio.Queue[Tuple[Any, Optional[float]]]) -> AsyncIterator[None]:
+        """Decode using a separate worker process."""
+        # Initialize decoder worker
+        if self._decoder_worker is None:
+            try:
+                from g3pylib._decoder_worker_manager import DecoderWorkerManager
+                self._decoder_worker = DecoderWorkerManager(maxsize=FRAME_QUEUE_SIZE)
+                await self._decoder_worker.start()
+                _logger.info("Started decoder worker process")
+            except Exception as e:
+                _logger.error(f"Failed to start decoder worker: {e}")
+                raise
+        
+        async def nal_submitter():
+            """Submit NALs to decoder worker."""
+            if self._decoder_worker is None:
+                raise RuntimeError("Decoder worker not initialized")
+            async with self.demux() as nal_unit_queue:
+                while True:
+                    nal_unit, timestamp = await nal_unit_queue.get()
+                    nal_data = nal_unit.data_with_prefix
+                    
+                    # Submit to worker (worker handles crashes internally)
+                    await self._decoder_worker.submit_nal(nal_data, timestamp)
+        
+        async def frame_receiver():
+            """Receive frames from decoder worker."""
+            import numpy as np
+            
+            if self._decoder_worker is None:
+                raise RuntimeError("Decoder worker not initialized")
+            while True:
+                result = await self._decoder_worker.get_frame(timeout=0.1)
+                if result is None:
+                    await asyncio.sleep(0.01)
+                    continue
+                
+                frame_data, timestamp = result
+                
+                # Reconstruct av.VideoFrame from frame_data dict
+                try:
+                    # Convert bytes back to numpy array
+                    img_data = np.frombuffer(frame_data['data'], dtype=np.uint8)
+                    img_data = img_data.reshape(
+                        (frame_data['height'], frame_data['width'], 3)
+                    )
+                    
+                    # Create av.VideoFrame from numpy array
+                    frame = av.VideoFrame.from_ndarray(img_data, format='bgr24')  # type: ignore
+                    frame.pts = frame_data['pts']
+                    
+                    await frame_queue.put((frame, timestamp))
+                    self._decode_count += 1
+                    
+                except Exception as e:
+                    _logger.error(f"Error reconstructing frame: {e}")
+                    continue
+        
+        submitter_task = _utils.create_task(nal_submitter(), name="nal_submitter")
+        receiver_task = _utils.create_task(frame_receiver(), name="frame_receiver")
+        
+        try:
+            yield
+        finally:
+            submitter_task.cancel()
+            receiver_task.cancel()
+            try:
+                await submitter_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                pass
+            
+            # Clean up decoder worker
+            if self._decoder_worker:
+                try:
+                    await self._decoder_worker.stop()
+                    _logger.info("Stopped decoder worker process")
+                except Exception as e:
+                    _logger.error(f"Error stopping decoder worker: {e}")
+    
+    @asynccontextmanager
+    async def _decode_in_process(self, frame_queue: asyncio.Queue[Tuple[Any, Optional[float]]]) -> AsyncIterator[None]:
+        """Decode in main process (original behavior)."""
         async def decoder():
             async with self.demux() as nal_unit_queue:
                 while True:
                     nal_unit, timestamp = await nal_unit_queue.get()
-                    # t0 = time.perf_counter()
-                    packets = cast(
-                        List[Any],
-                        self.codec_context.parse(nal_unit.data_with_prefix),
-                    )
+                    nal_data = nal_unit.data_with_prefix
+                    
+                    # Parse NAL
+                    try:
+                        packets = cast(List[Any], self.codec_context.parse(nal_data))
+                    except Exception as e:
+                        _logger.warning(f"Parse exception: {e}")
+                        continue
+                    
+                    # Decode packets
                     frames = functools.reduce(
                         lambda frame_acc, packet: frame_acc
                         + self.codec_context.decode(packet),
                         packets,
                         [],
                     )
-                    # t1 = time.perf_counter()
-                    # logger.debug(f"Decoded NAL unit in {t1 - t0:.6f} seconds")
+                    
                     for frame in frames:
                         await frame_queue.put((frame, timestamp))
                         self._decode_count += 1
 
         decoder_task = _utils.create_task(decoder(), name="decoder")
         try:
-            yield frame_queue
+            yield
         finally:
             decoder_task.cancel()
             try:
@@ -569,8 +705,24 @@ class Streams:
         sync: bool = False,
         imu: bool = False,
         events: bool = False,
+        safe_decode: Optional[bool] = None,
     ) -> AsyncIterator[Streams]:
-        """Sets up an RTSP media session with the specified streams and creates an instance of `Streams`."""
+        """Sets up an RTSP media session with the specified streams and creates an instance of `Streams`.
+        
+        Args:
+            rtsp_url: The RTSP URL to connect to
+            scene_camera: Enable scene camera stream
+            audio: Enable audio stream
+            eye_cameras: Enable eye cameras stream
+            gaze: Enable gaze data stream
+            sync: Enable sync stream
+            imu: Enable IMU stream
+            events: Enable events stream
+            safe_decode: Optional override. If None (default), uses the global SAFE_DECODE=True.
+        """
+        if safe_decode is None:
+            safe_decode = SAFE_DECODE
+        
         parsed_url = urlparse(rtsp_url)
         async with RTSPConnection(parsed_url.hostname, parsed_url.port) as connection:
             async with AsyncExitStack() as stack:
@@ -579,7 +731,7 @@ class Streams:
                     streams.add(
                         await stack.enter_async_context(
                             VideoStream.setup(
-                                connection, StreamType.SCENE_CAMERA, parsed_url.scheme
+                                connection, StreamType.SCENE_CAMERA, parsed_url.scheme, safe_decode
                             )
                         )
                     )
@@ -587,7 +739,7 @@ class Streams:
                     streams.add(
                         await stack.enter_async_context(
                             VideoStream.setup(
-                                connection, StreamType.EYE_CAMERAS, parsed_url.scheme
+                                connection, StreamType.EYE_CAMERAS, parsed_url.scheme, safe_decode
                             )
                         )
                     )

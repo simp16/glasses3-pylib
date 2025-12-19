@@ -7,7 +7,7 @@ import pytest
 from g3pylib import Glasses3, connect_to_glasses
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 async def g3() -> AsyncIterable[Glasses3]:
     g3_hostname = os.environ["G3_HOSTNAME"]
     async with connect_to_glasses.with_hostname(g3_hostname) as g3:
@@ -16,7 +16,7 @@ async def g3() -> AsyncIterable[Glasses3]:
         await g3.recordings.stop_children_handler_tasks()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def event_loop():
     loop = asyncio.new_event_loop()
     yield loop

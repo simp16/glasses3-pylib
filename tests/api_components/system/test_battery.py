@@ -3,6 +3,7 @@ import pytest
 from g3pylib import Glasses3
 from g3pylib.system.battery import BatteryState
 
+pytestmark = pytest.mark.asyncio(loop_scope="class")
 
 async def test_get_charging(g3: Glasses3):
     charging = await g3.system.battery.get_charging()
